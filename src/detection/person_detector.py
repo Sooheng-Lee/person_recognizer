@@ -22,12 +22,14 @@ from ..utils.logger import get_logger
 @dataclass
 class Detection:
     """
-    Represents a single person detection.
+    Represents a single person detection with 3D coordinates.
     
     Attributes:
         id: Tracking ID (if tracking enabled)
         bbox: Bounding box [x1, y1, x2, y2]
         center: Center point (x, y)
+        center_3d: 3D center point (x, y, z) where z is estimated depth
+        depth_z: Estimated depth/distance in relative units or meters
         confidence: Detection confidence score
         class_id: Class ID (0 for person in COCO)
         class_name: Class name
@@ -35,6 +37,8 @@ class Detection:
     id: int = -1
     bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)  # x1, y1, x2, y2
     center: Tuple[int, int] = (0, 0)
+    center_3d: Tuple[float, float, float] = (0.0, 0.0, 0.0)  # x, y, z
+    depth_z: float = 0.0  # Estimated depth in meters (approximate)
     confidence: float = 0.0
     class_id: int = 0
     class_name: str = "person"
@@ -73,6 +77,8 @@ class Detection:
             "id": self.id,
             "bbox": list(self.bbox),
             "center": list(self.center),
+            "center_3d": list(self.center_3d),
+            "depth_z": round(self.depth_z, 2),
             "confidence": round(self.confidence, 3),
             "class_id": self.class_id,
             "class_name": self.class_name,
@@ -82,7 +88,154 @@ class Detection:
         }
     
     def __str__(self) -> str:
-        return f"Person(id={self.id}, center={self.center}, conf={self.confidence:.2f})"
+        return f"Person(id={self.id}, center={self.center}, depth={self.depth_z:.2f}m, conf={self.confidence:.2f})"
+
+
+class DepthEstimator:
+    """
+    Estimates depth (z-axis distance) from bounding box size.
+    
+    Uses the pinhole camera model with assumed average human height.
+    This is an approximation and works best when:
+    - Camera is roughly at human chest/face height
+    - People are standing upright
+    - Focal length is calibrated
+    
+    Formula: Z = (f * H_real) / h_pixel
+    where:
+        Z = depth distance
+        f = focal length (in pixels)
+        H_real = real height of person (average ~1.7m)
+        h_pixel = height of person in pixels (bounding box height)
+    """
+    
+    # Average human height in meters
+    AVERAGE_HUMAN_HEIGHT = 1.7  # meters
+    
+    # Default focal length (can be calibrated)
+    # Approximate for typical webcam at 1080p
+    DEFAULT_FOCAL_LENGTH = 800  # pixels
+    
+    def __init__(
+        self,
+        focal_length: float = None,
+        reference_height: float = None,
+        frame_height: int = 1080
+    ):
+        """
+        Initialize depth estimator.
+        
+        Args:
+            focal_length: Camera focal length in pixels (None for auto-estimate)
+            reference_height: Reference human height in meters
+            frame_height: Frame height for focal length estimation
+        """
+        self.reference_height = reference_height or self.AVERAGE_HUMAN_HEIGHT
+        self.frame_height = frame_height
+        
+        if focal_length is not None:
+            self.focal_length = focal_length
+        else:
+            # Estimate focal length based on frame height
+            # Typical webcam FOV is ~60-70 degrees
+            # f = frame_height / (2 * tan(FOV/2))
+            import math
+            fov_degrees = 65  # Typical webcam FOV
+            fov_radians = math.radians(fov_degrees)
+            self.focal_length = frame_height / (2 * math.tan(fov_radians / 2))
+    
+    def estimate_depth(
+        self,
+        bbox_height: int,
+        frame_height: int = None
+    ) -> float:
+        """
+        Estimate depth from bounding box height.
+        
+        Args:
+            bbox_height: Height of person bounding box in pixels
+            frame_height: Current frame height (for dynamic adjustment)
+            
+        Returns:
+            Estimated depth in meters
+        """
+        if bbox_height <= 0:
+            return 0.0
+        
+        # Adjust focal length if frame height changed
+        if frame_height and frame_height != self.frame_height:
+            scale = frame_height / self.frame_height
+            adjusted_focal = self.focal_length * scale
+        else:
+            adjusted_focal = self.focal_length
+        
+        # Calculate depth: Z = (f * H_real) / h_pixel
+        depth = (adjusted_focal * self.reference_height) / bbox_height
+        
+        # Clamp to reasonable range (0.5m to 20m)
+        depth = max(0.5, min(20.0, depth))
+        
+        return depth
+    
+    def estimate_3d_position(
+        self,
+        center_x: int,
+        center_y: int,
+        bbox_height: int,
+        frame_width: int,
+        frame_height: int
+    ) -> Tuple[float, float, float]:
+        """
+        Estimate 3D position (X, Y, Z) in camera coordinate system.
+        
+        Args:
+            center_x: Center X in pixels
+            center_y: Center Y in pixels
+            bbox_height: Bounding box height in pixels
+            frame_width: Frame width
+            frame_height: Frame height
+            
+        Returns:
+            (X, Y, Z) in meters where:
+            - X: horizontal distance (positive = right)
+            - Y: vertical distance (positive = down)
+            - Z: depth distance (positive = forward)
+        """
+        # Estimate depth
+        z = self.estimate_depth(bbox_height, frame_height)
+        
+        # Calculate X and Y using similar triangles
+        # X = (center_x - frame_width/2) * Z / focal_length
+        # Y = (center_y - frame_height/2) * Z / focal_length
+        
+        # Adjust focal length for current frame
+        scale = frame_height / self.frame_height if self.frame_height else 1.0
+        adjusted_focal = self.focal_length * scale
+        
+        # Center of frame
+        cx = frame_width / 2
+        cy = frame_height / 2
+        
+        # Calculate X and Y in meters
+        x = (center_x - cx) * z / adjusted_focal
+        y = (center_y - cy) * z / adjusted_focal
+        
+        return (round(x, 2), round(y, 2), round(z, 2))
+    
+    def calibrate(self, known_distance: float, bbox_height: int, frame_height: int = None):
+        """
+        Calibrate focal length using a known distance.
+        
+        Args:
+            known_distance: Known distance to person in meters
+            bbox_height: Bounding box height at that distance
+            frame_height: Frame height during calibration
+        """
+        if frame_height and frame_height != self.frame_height:
+            self.frame_height = frame_height
+        
+        # Solve for focal length: f = (Z * h_pixel) / H_real
+        self.focal_length = (known_distance * bbox_height) / self.reference_height
 
 
 class PersonDetectorOpenCV:
@@ -102,7 +255,8 @@ class PersonDetectorOpenCV:
     def __init__(
         self,
         confidence_threshold: float = 0.5,
-        nms_threshold: float = 0.4
+        nms_threshold: float = 0.4,
+        enable_depth: bool = True
     ):
         """
         Initialize OpenCV-based person detector.
@@ -110,10 +264,12 @@ class PersonDetectorOpenCV:
         Args:
             confidence_threshold: Minimum confidence for detections
             nms_threshold: Non-maximum suppression threshold
+            enable_depth: Enable depth estimation
         """
         self.logger = get_logger("PersonDetectorOpenCV")
         self.confidence_threshold = confidence_threshold
         self.nms_threshold = nms_threshold
+        self.enable_depth = enable_depth
         
         self._net = None
         self._classes = []
@@ -121,6 +277,9 @@ class PersonDetectorOpenCV:
         self._is_loaded = False
         self._last_detections: List[Detection] = []
         self._inference_time: float = 0.0
+        
+        # Depth estimator
+        self._depth_estimator = DepthEstimator() if enable_depth else None
         
         # Model directory
         self._model_dir = Path(__file__).parent / "models"
@@ -130,6 +289,7 @@ class PersonDetectorOpenCV:
         self._box_color = (0, 255, 0)  # Green
         self._text_color = (255, 255, 255)  # White
         self._center_color = (0, 0, 255)  # Red
+        self._depth_color = (255, 165, 0)  # Orange for depth info
     
     def _download_file(self, url: str, filepath: Path) -> bool:
         """Download a file from URL."""
@@ -269,14 +429,26 @@ class PersonDetectorOpenCV:
                     x, y, w, h = boxes[i]
                     x1, y1 = max(0, x), max(0, y)
                     x2, y2 = min(width, x + w), min(height, y + h)
+                    bbox_height = y2 - y1
                     
                     center_x = (x1 + x2) // 2
                     center_y = (y1 + y2) // 2
+                    
+                    # Estimate depth if enabled
+                    depth_z = 0.0
+                    center_3d = (0.0, 0.0, 0.0)
+                    if self.enable_depth and self._depth_estimator:
+                        center_3d = self._depth_estimator.estimate_3d_position(
+                            center_x, center_y, bbox_height, width, height
+                        )
+                        depth_z = center_3d[2]
                     
                     detection = Detection(
                         id=-1,
                         bbox=(x1, y1, x2, y2),
                         center=(center_x, center_y),
+                        center_3d=center_3d,
+                        depth_z=depth_z,
                         confidence=confidences[i],
                         class_id=class_ids[i],
                         class_name="person"
@@ -336,12 +508,16 @@ class PersonDetectorOpenCV:
                 cv2.circle(output, (cx, cy), 5, self._center_color, -1)
                 cv2.circle(output, (cx, cy), 8, self._center_color, 2)
             
-            # Draw label
+            # Draw label with depth info
             if draw_label:
                 if det.id >= 0:
                     label = f"Person #{det.id} ({det.confidence:.2f})"
                 else:
                     label = f"Person ({det.confidence:.2f})"
+                
+                # Add depth to label if available
+                if det.depth_z > 0:
+                    label += f" Z:{det.depth_z:.1f}m"
                 
                 # Label background
                 (label_w, label_h), _ = cv2.getTextSize(
@@ -361,8 +537,9 @@ class PersonDetectorOpenCV:
                     0.6, self._text_color, 2
                 )
             
-            # Draw coordinates
+            # Draw 3D coordinates
             if draw_coordinates:
+                # 2D pixel coordinates
                 coord_text = f"({cx}, {cy})"
                 cv2.putText(
                     output, coord_text,
@@ -370,18 +547,29 @@ class PersonDetectorOpenCV:
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, self._text_color, 2
                 )
+                
+                # 3D coordinates (X, Y, Z in meters)
+                if det.depth_z > 0:
+                    x3d, y3d, z3d = det.center_3d
+                    coord_3d_text = f"3D:({x3d:.1f}, {y3d:.1f}, {z3d:.1f})m"
+                    cv2.putText(
+                        output, coord_3d_text,
+                        (cx - 60, cy + 45),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, self._depth_color, 2
+                    )
         
         return output
     
     def get_coordinates(self, detections: Optional[List[Detection]] = None) -> List[Dict]:
         """
-        Get coordinates of all detected people.
+        Get coordinates of all detected people including 3D position.
         
         Args:
             detections: List of detections (uses last detections if None)
             
         Returns:
-            List of coordinate dictionaries
+            List of coordinate dictionaries with 2D and 3D positions
         """
         if detections is None:
             detections = self._last_detections
@@ -392,6 +580,12 @@ class PersonDetectorOpenCV:
                 "id": det.id,
                 "center_x": det.center[0],
                 "center_y": det.center[1],
+                "center_3d": {
+                    "x": det.center_3d[0],
+                    "y": det.center_3d[1],
+                    "z": det.center_3d[2]
+                },
+                "depth_z": round(det.depth_z, 2),
                 "bbox": {
                     "x1": det.x1,
                     "y1": det.y1,
@@ -474,7 +668,8 @@ class PersonDetectorUltralytics:
         model_name: str = 'yolov8n',
         confidence_threshold: float = 0.5,
         device: str = 'auto',
-        enable_tracking: bool = False
+        enable_tracking: bool = False,
+        enable_depth: bool = True
     ):
         """
         Initialize person detector with ultralytics.
@@ -484,22 +679,28 @@ class PersonDetectorUltralytics:
             confidence_threshold: Minimum confidence for detections
             device: Device to run on ('cpu', 'cuda', 'auto')
             enable_tracking: Enable object tracking
+            enable_depth: Enable depth estimation
         """
         self.logger = get_logger("PersonDetectorUltralytics")
         self.model_name = model_name
         self.confidence_threshold = confidence_threshold
         self.device = device
         self.enable_tracking = enable_tracking
+        self.enable_depth = enable_depth
         
         self._model = None
         self._is_loaded = False
         self._last_detections: List[Detection] = []
         self._inference_time: float = 0.0
         
+        # Depth estimator
+        self._depth_estimator = DepthEstimator() if enable_depth else None
+        
         # Colors for visualization
         self._box_color = (0, 255, 0)  # Green
         self._text_color = (255, 255, 255)  # White
         self._center_color = (0, 0, 255)  # Red
+        self._depth_color = (255, 165, 0)  # Orange for depth info
     
     def load_model(self) -> bool:
         """
@@ -602,10 +803,23 @@ class PersonDetectorUltralytics:
                     center_x = (x1 + x2) // 2
                     center_y = (y1 + y2) // 2
                     
+                    # Estimate depth if enabled
+                    depth_z = 0.0
+                    center_3d = (0.0, 0.0, 0.0)
+                    bbox_height = y2 - y1
+                    if self.enable_depth and self._depth_estimator:
+                        height, width = frame.shape[:2]
+                        center_3d = self._depth_estimator.estimate_3d_position(
+                            center_x, center_y, bbox_height, width, height
+                        )
+                        depth_z = center_3d[2]
+                    
                     detection = Detection(
                         id=track_id,
                         bbox=(x1, y1, x2, y2),
                         center=(center_x, center_y),
+                        center_3d=center_3d,
+                        depth_z=depth_z,
                         confidence=conf,
                         class_id=class_id,
                         class_name="person"
@@ -656,6 +870,10 @@ class PersonDetectorUltralytics:
                 else:
                     label = f"Person ({det.confidence:.2f})"
                 
+                # Add depth to label if available
+                if det.depth_z > 0:
+                    label += f" Z:{det.depth_z:.1f}m"
+                
                 (label_w, label_h), _ = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
                 )
@@ -674,6 +892,7 @@ class PersonDetectorUltralytics:
                 )
             
             if draw_coordinates:
+                # 2D pixel coordinates
                 coord_text = f"({cx}, {cy})"
                 cv2.putText(
                     output, coord_text,
@@ -681,11 +900,22 @@ class PersonDetectorUltralytics:
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, self._text_color, 2
                 )
+                
+                # 3D coordinates (X, Y, Z in meters)
+                if det.depth_z > 0:
+                    x3d, y3d, z3d = det.center_3d
+                    coord_3d_text = f"3D:({x3d:.1f}, {y3d:.1f}, {z3d:.1f})m"
+                    cv2.putText(
+                        output, coord_3d_text,
+                        (cx - 60, cy + 45),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, self._depth_color, 2
+                    )
         
         return output
     
     def get_coordinates(self, detections: Optional[List[Detection]] = None) -> List[Dict]:
-        """Get coordinates of all detected people."""
+        """Get coordinates of all detected people including 3D position."""
         if detections is None:
             detections = self._last_detections
         
@@ -695,6 +925,12 @@ class PersonDetectorUltralytics:
                 "id": det.id,
                 "center_x": det.center[0],
                 "center_y": det.center[1],
+                "center_3d": {
+                    "x": det.center_3d[0],
+                    "y": det.center_3d[1],
+                    "z": det.center_3d[2]
+                },
+                "depth_z": round(det.depth_z, 2),
                 "bbox": {
                     "x1": det.x1,
                     "y1": det.y1,
