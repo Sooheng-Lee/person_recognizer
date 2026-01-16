@@ -1,0 +1,25 @@
+# USB Camera Viewer - Python Dependencies
+# Python 3.10+ required
+
+# GUI Framework
+PyQt5>=5.15.9
+PyQt5-Qt5>=5.15.2
+PyQt5-sip>=12.11.0
+
+# Video/Image Processing
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# System/Device Detection
+pywin32>=306  # Windows-specific USB device handling
+
+# Utilities
+Pillow>=10.0.0  # Image processing for screenshots
+
+# YOLO Object Detection (Optional - for better performance)
+# Note: If torch/ultralytics fails to load, OpenCV DNN fallback will be used automatically
+# ultralytics>=8.0.0  # YOLOv8 for person detection (optional)
+# torch>=2.0.0  # PyTorch backend (optional)
+
+# To enable YOLOv8 (faster, more accurate), run:
+# pip install ultralytics torch
